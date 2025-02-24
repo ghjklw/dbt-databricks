@@ -2,6 +2,7 @@ import decimal
 import re
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
@@ -9,6 +10,7 @@ from dbt_common.exceptions import DbtRuntimeError
 
 import databricks.sql as dbsql
 from databricks.sql.client import Connection, Cursor
+from databricks.sql.exc import Error
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.databricks import utils
 from dbt.adapters.databricks.__version__ import version as __version__
@@ -16,7 +18,7 @@ from dbt.adapters.databricks.credentials import DatabricksCredentials, TCredenti
 from dbt.adapters.databricks.logging import logger
 
 if TYPE_CHECKING:
-    pass
+    from databricks.sql.types import Row
 
 
 CursorOp = Callable[[Cursor], None]
@@ -27,6 +29,22 @@ LogOp = Callable[[], str]
 FailLogOp = Callable[[Exception], str]
 
 
+@dataclass
+class DatabricksAdapterResponse(AdapterResponse):
+    query_id: str = ""
+    rows_updated: Optional[int] = None
+    rows_deleted: Optional[int] = None
+    rows_inserted: Optional[int] = None
+
+
+@dataclass
+class DatabricksQueryStatistics:
+    num_affected_rows: Optional[int] = None
+    num_updated_rows: Optional[int] = None
+    num_deleted_rows: Optional[int] = None
+    num_inserted_rows: Optional[int] = None
+
+
 class CursorWrapper:
     """
     Wrap the DBSQL cursor to abstract the details from DatabricksConnectionManager.
@@ -35,6 +53,7 @@ class CursorWrapper:
     def __init__(self, cursor: Cursor):
         self._cursor = cursor
         self.open = True
+        self._cache_fetchone: Optional[Row] = None
 
     @property
     def description(self) -> Optional[list[tuple]]:
@@ -69,17 +88,56 @@ class CursorWrapper:
             logger.debug(startLog())
             utils.handle_exceptions_as_warning(lambda: cleanup(self._cursor), failLog)
 
-    def fetchall(self) -> Sequence[tuple]:
+    def fetchall(self) -> "Sequence[Row]":
         return self._safe_execute(lambda cursor: cursor.fetchall())
 
-    def fetchone(self) -> Optional[tuple]:
+    def fetchone(self) -> "Optional[Row]":
         return self._safe_execute(lambda cursor: cursor.fetchone())
 
-    def fetchmany(self, size: int) -> Sequence[tuple]:
+    def fetchmany(self, size: int) -> "Sequence[Row]":
         return self._safe_execute(lambda cursor: cursor.fetchmany(size))
 
-    def get_response(self) -> AdapterResponse:
-        return AdapterResponse(_message="OK", query_id=self._cursor.query_id or "N/A")
+    def get_query_statistics(self) -> DatabricksQueryStatistics:
+        """Get the number of rows affected by the last query.
+
+        Delta returns for merge, update and insert commands a single row containing:
+            - num_affected_rows: the number of rows affected by the query
+            - num_updated_rows: the number of rows updated by the query
+            - num_deleted_rows: the number of rows deleted by the query
+            - num_inserted_rows: the number of rows inserted by the query
+
+        This method attempts to retrieve it from the last query, while caching the result to make
+        sure it does not interfere with the fetchone method.
+        """
+        if not self._cache_fetchone:
+            try:
+                # Cache the result to be able to return it if fetchone is called later
+                self._cache_fetchone = self._cursor.fetchone()
+            except Error:
+                return DatabricksQueryStatistics()
+
+            if not self._cache_fetchone:
+                return DatabricksQueryStatistics()
+
+        # Cast the result to check that is indeed query metadata
+        try:
+            return DatabricksQueryStatistics(**self._cache_fetchone.asDict())
+        except TypeError:
+            return DatabricksQueryStatistics()
+
+    def get_response(self, include_statistics: bool = False) -> DatabricksAdapterResponse:
+        response = DatabricksAdapterResponse(_message="OK", query_id=self._cursor.query_id or "N/A")
+
+        # If some query metadata are available, add them to the adapter response
+        if include_statistics:
+            query_statistics = self.get_query_statistics()
+            logger.debug(query_statistics)
+            response.rows_affected = query_statistics.num_affected_rows
+            response.rows_inserted = query_statistics.num_inserted_rows
+            response.rows_updated = query_statistics.num_updated_rows
+            response.rows_deleted = query_statistics.num_deleted_rows
+
+        return response
 
     T = TypeVar("T")
 
